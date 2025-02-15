@@ -1,0 +1,30 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: airhockey
+    ports:
+      - 5434:5432
+    volumes:
+      - ./docker/postgres/init.d:/docker-entrypoint-initdb.d
+      - ./docker/postgres/pgdata:/var/lib/postgresql/data
+    environment:
+      POSTGRES_USER: ginuser
+      POSTGRES_PASSWORD: ginpassword
+      POSTGRES_INITDB_ARGS: "--encoding=UTF-8"
+      POSTGRES_DB: airhockey
+    hostname: postgres
+    restart: always
+    user: root
+
+  pgadmin:
+    image: dpage/pgadmin4
+    restart: always
+    ports:
+      - 84:80
+    environment:
+      PGADMIN_DEFAULT_EMAIL: gin@example.com
+      PGADMIN_DEFAULT_PASSWORD: ginpassword
+    volumes:
+      - ./docker/pgadmin:/var/lib/pgadmin
+    depends_on:
+      - postgres
