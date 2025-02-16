@@ -22,6 +22,7 @@ type Room struct {
 	RoomID    int
 	Players   []*Client
 	GameState *GameState
+	Audience  []*Client
 	// Mutex     sync.Mutex
 }
 

@@ -289,10 +289,18 @@ func (c *UserController) HandleWebSocket(ctx *gin.Context) {
 				conn.WriteMessage(messageType, []byte(message))
 				room := rooms[reClient.RoomID]
 				//二度以上の接続かチェック（reconnectのたびに追加していないか）
-				if room.Players == nil {
+				exists := false
+				if len(room.Audience) != 0 {
+					for i := range room.Audience {
+						if room.Audience[i].ID == receivedMsg.Message {
+							room.Audience[i] = reClient
+							exists = true
+						}
+					}
+				}
+				if len(room.Players) == 0 {
 					room.Players = append(room.Players, reClient)
 				} else {
-					exists := false
 					for i := range room.Players {
 						if room.Players[i].ID == reClient.ID {
 							room.Players[i] = reClient
@@ -361,6 +369,37 @@ func (c *UserController) HandleWebSocket(ctx *gin.Context) {
 				continue
 			}
 			updateGameState(room)
+		} else if receivedMsg.Type == "audience" {
+			if receivedMsg.RoomID < 0 {
+				return
+			}
+			room := rooms[receivedMsg.RoomID]
+			if room == nil {
+				message := `{"type":"error", "message": "ルームが存在しません"}`
+				conn.WriteMessage(messageType, []byte(message))
+				return
+			}
+			audience := &models.Client{
+				ID:     clientID,
+				Conn:   conn,
+				RoomID: receivedMsg.RoomID,
+			}
+			if len(room.Audience) == 0 {
+				room.Audience = append(room.Audience, audience)
+			} else {
+				exists := false
+				for i := range room.Audience {
+					if room.Audience[i].ID == audience.ID {
+						room.Audience[i] = audience
+						exists = true
+					}
+				}
+				if !exists {
+					room.Audience = append(room.Audience, audience)
+				}
+			}
+			message := fmt.Sprintf(`{"type":"ready","message":"%s","RoomNum":"%d"}`, clientID, audience.RoomID)
+			conn.WriteMessage(messageType, []byte(message))
 		} else {
 			fmt.Println("client error")
 			return
@@ -392,8 +431,9 @@ func (c *UserController) HandleWebSocket(ctx *gin.Context) {
 
 func BattleReady(roomnum int) {
 	newRoom := &models.Room{
-		RoomID:  roomnum,
-		Players: []*models.Client{},
+		RoomID: roomnum,
+		// Players: []*models.Client{},
+		Players: make([]*models.Client, 0),
 		GameState: &models.GameState{
 			PuckX:      385.0,
 			PuckY:      185.0,
@@ -407,6 +447,7 @@ func BattleReady(roomnum int) {
 			Score2:     0,
 			Time:       60 * 120, //2min 120 * 60
 		},
+		Audience: make([]*models.Client, 0),
 	}
 	rooms[roomnum] = newRoom
 }
@@ -414,15 +455,16 @@ func BattleReady(roomnum int) {
 func Battle(clientID string) {
 	time.Sleep(5 * time.Second)
 	mu.Lock()
-	defer mu.Unlock()
 	player, ok := clients[clientID]
 	if !ok {
 		fmt.Println("player is nil in Battle")
+		mu.Unlock()
 		return
 	}
 	conn := player.Conn
 	if conn == nil {
 		fmt.Println("player.Conn is nil in Battle")
+		mu.Unlock()
 		return
 	}
 
@@ -433,9 +475,10 @@ func Battle(clientID string) {
 		fmt.Println(room, ok, "ルームが見つかりません")
 		message := `{"type":"error", "message": "ルームが見つかりません"}`
 		conn.WriteMessage(websocket.TextMessage, []byte(message))
+		mu.Unlock()
 		return
 	}
-
+	mu.Unlock()
 	go gameLoop(room, conn)
 }
 
@@ -546,20 +589,28 @@ func updateGameState(room *models.Room) {
 // クライアントにゲーム状態を送信
 func broadcastGameState(room *models.Room) {
 	mu.Lock()
-	defer mu.Unlock()
+
+	gameStateJSON, err := json.Marshal(room.GameState)
+	if err != nil {
+		fmt.Println("GameState JSON変換エラー:", err)
+		mu.Unlock()
+		return
+	}
+	message := fmt.Sprintf(`{"type":"battle","message":%s}`, gameStateJSON)
+	// fmt.Println(message)
 	for _, client := range room.Players {
-		gameStateJSON, err := json.Marshal(room.GameState)
-		if err != nil {
-			fmt.Println("GameState JSON変換エラー:", err)
-			return
-		}
-		message := fmt.Sprintf(`{"type":"battle","message":%s}`, gameStateJSON)
-		// fmt.Println(message)
 		err = client.Conn.WriteJSON([]byte(message))
 		if err != nil {
-			fmt.Println("送信エラー:", err)
+			// fmt.Println("送信エラー:", err)
 		}
 	}
+	for _, client := range room.Audience {
+		err = client.Conn.WriteJSON([]byte(message))
+		if err != nil {
+			// fmt.Println("送信エラー:", err)
+		}
+	}
+	mu.Unlock()
 }
 
 func numControll() {
@@ -573,8 +624,19 @@ func numControll() {
 		if err != nil {
 			fmt.Println("メッセージ送信エラー:", err)
 			continue
-			// clients[client].Conn.Close()
-			// delete(clients, client)
+		}
+		room := rooms[clients[client].RoomID]
+		if room == nil {
+			continue
+		} else {
+			message = fmt.Sprintf(`{"type":"audiences","message":%d}`, len(room.Audience))
+			err = clients[client].Conn.WriteMessage(websocket.TextMessage, []byte(message))
+			if err != nil {
+				fmt.Println("メッセージ送信エラー:", err)
+				continue
+				// clients[client].Conn.Close()
+				// delete(clients, client)
+			}
 		}
 	}
 	// fmt.Println(userNum)
