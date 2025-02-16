@@ -24,6 +24,7 @@ type Room struct {
 	GameState *GameState
 	Audience  []*Client
 	// Mutex     sync.Mutex
+	Start bool
 }
 
 type Score struct { //バトル履歴などをデータベースに保存する

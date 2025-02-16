@@ -28,42 +28,46 @@ type UserController struct {
 
 // メモリサービス
 type MemoryService struct {
-	memory   map[string]*models.Client
-	mutex    sync.Mutex
+	// memory   map[string]*models.Client
+	memory   sync.Map
 	duration time.Duration // 一定時間後に削除する時間
 }
 
 // メモリの情報を更新する関数
 func (ms *MemoryService) UpdateMemory(clientID string, client *models.Client, c *UserController) {
-	ms.mutex.Lock()
-	defer ms.mutex.Unlock()
+	ms.memory.Store(clientID, client)
 
 	// クライアント情報とともに時刻を記録
-	ms.memory[clientID] = client
-	key := &client.Key
+	key := client.Key
 	// ゴルーチンで削除処理を開始
-	go ms.scheduleDeletion(clientID, c, key)
+	go ms.scheduleDeletion(clientID, c, &key)
 }
 
 // メモリからクライアント情報を削除する関数
 func (ms *MemoryService) scheduleDeletion(clientID string, c *UserController, key *string) {
 	// 一定時間後に削除
 	time.Sleep(ms.duration)
-	ms.mutex.Lock()
-	defer ms.mutex.Unlock()
-	clients, err := c.memoryservice.FindMemories(clientID)
-	if err != nil {
+	value, ok := ms.memory.Load(clientID)
+	if !ok {
 		return
 	}
-	for _, v := range *clients {
-		fmt.Println(v.Key, *key, "scheduleDeletion()", v.Key == *key)
-		if v.Key == *key {
-			c.memoryservice.DeleteMemory(clientID)
-		}
+	client := value.(*models.Client)
+	if client.Key == *key {
+		c.memoryservice.DeleteMemory(clientID)
+		ms.memory.Delete(clientID)
 	}
-
+	// clients, err := c.memoryservice.FindMemories(clientID)
+	// if err != nil {
+	// 	return
+	// }
+	// for _, v := range *clients {
+	// 	fmt.Println(v.Key, *key, "scheduleDeletion()", v.Key == *key)
+	// 	if v.Key == *key {
+	// 		c.memoryservice.DeleteMemory(clientID)
+	// 	}
+	// }
 	// クライアント情報が存在すれば削除
-	delete(ms.memory, clientID)
+	// delete(ms.memory, clientID)
 	// fmt.Println("Client removed after timeout:", clientID)
 }
 
@@ -81,7 +85,7 @@ var (
 		},
 	}
 	clients = make(map[string]*models.Client) // クライアントリスト
-	rooms   = make(map[int]*models.Room)
+	rooms   = make(map[int]*models.Room, 0)
 	mu      sync.Mutex // 排他制御
 )
 
@@ -103,6 +107,7 @@ func (c *UserController) HandleWebSocket(ctx *gin.Context) {
 	clients[clientID] = &models.Client{ID: clientID, Conn: conn, RoomID: -1, Key: "0"}
 	err = c.memoryservice.CreateMemory(clients[clientID])
 	if err != nil {
+		mu.Unlock()
 		return
 	}
 	// fmt.Println(clients[clientID])
@@ -117,7 +122,7 @@ func (c *UserController) HandleWebSocket(ctx *gin.Context) {
 		// 	delete(rooms, room.RoomID)
 		// }
 		memoryService := MemoryService{
-			memory:   make(map[string]*models.Client),
+			// memory:   make(map[string]*models.Client),
 			duration: 5 * time.Second, // 3秒後に削除
 		}
 		client, ok := clients[clientID]
@@ -132,18 +137,18 @@ func (c *UserController) HandleWebSocket(ctx *gin.Context) {
 			go memoryService.UpdateMemory(clientID, client, c)
 			delete(clients, clientID)
 		}
-		if room, ok := rooms[client.RoomID]; ok {
-			// roomが見つかった場合の処理
-			//対戦相手にコネクションが失われたと送信
-			for i := range room.Players {
-				if room.Players[i].ID == clientID {
-					room.Players = append(room.Players[:i], room.Players[i+1:]...)
-				}
-			}
-		} else {
-			// roomが見つからなかった場合の処理
-			// fmt.Println("Error: Room not found,", client.RoomID)
-		}
+		// if room, ok := rooms[client.RoomID]; ok {
+		// 	// roomが見つかった場合の処理
+		// 	//対戦相手にコネクションが失われたと送信
+		// 	for i := range room.Players {
+		// 		if room.Players[i].ID == clientID {
+		// 			room.Players = append(room.Players[:i], room.Players[i+1:]...)
+		// 		}
+		// 	}
+		// } else {
+		// 	// roomが見つからなかった場合の処理
+		// 	// fmt.Println("Error: Room not found,", client.RoomID)
+		// }
 		mu.Unlock()
 		numControll()
 		fmt.Println("切断完了:", clientID)
@@ -166,6 +171,14 @@ func (c *UserController) HandleWebSocket(ctx *gin.Context) {
 		if receivedMsg.Type == "join" {
 			mu.Lock()
 			roomnum := rand.Intn(1000000)
+			for {
+				if rooms[roomnum] != nil {
+					roomnum = rand.Intn(1000000)
+				} else {
+					break
+				}
+			}
+
 			key := uuid.New().String()
 			clients[clientID] = &models.Client{
 				ID:     clientID,
@@ -179,9 +192,10 @@ func (c *UserController) HandleWebSocket(ctx *gin.Context) {
 			mu.Unlock()
 			//この時点でルームを作成し、ホストにしてもよい
 		} else if receivedMsg.Type == "join for" {
-			if receivedMsg.RoomID <= 0 {
+			room := rooms[receivedMsg.RoomID]
+			if receivedMsg.RoomID <= 0 || (room != nil && room.Start) {
 				//nullもしたほうがいいかも
-				message := `{"type":"error", "message": "0以上の数値を入力してください"}`
+				message := `{"type":"error", "message": "有効な数値を入力してください"}`
 				conn.WriteMessage(messageType, []byte(message))
 			} else {
 				model, err := c.memoryservice.FindMessageMemory(receivedMsg)
@@ -302,7 +316,7 @@ func (c *UserController) HandleWebSocket(ctx *gin.Context) {
 					room.Players = append(room.Players, reClient)
 				} else {
 					for i := range room.Players {
-						if room.Players[i].ID == reClient.ID {
+						if room.Players[i].ID == receivedMsg.Message {
 							room.Players[i] = reClient
 							exists = true
 						}
@@ -315,11 +329,14 @@ func (c *UserController) HandleWebSocket(ctx *gin.Context) {
 				// delete(clients, clientID)
 				// c.memoryservice.DeleteMemory(clientID)
 				// clientID = receivedMsg.Message
+				if !room.Start && len(room.Players) >= 2 {
+					go Battle(room.Players[0].ID, room.Players[1].ID)
+					room.Start = true
+					fmt.Println("start")
+				}
 				mu.Unlock()
 				// }
-				if len(room.Players) >= 2 {
-					go Battle(clientID)
-				}
+				//一回のみ実行したい
 				numControll()
 				message = `{"type":"reconnect", "message": "再接続成功"}`
 				conn.WriteMessage(messageType, []byte(message))
@@ -328,55 +345,69 @@ func (c *UserController) HandleWebSocket(ctx *gin.Context) {
 			// fmt.Println("battle start")
 			// fmt.Println(clientID)
 			// Battle(clientID)
+
 			//一回のみ実行したい
 			return
 		} else if receivedMsg.Type == "update" {
 			// fmt.Println("update")
+			mu.Lock()
 			if receivedMsg.Message == "" {
 				fmt.Println("間違ったコネクションです")
+				mu.Unlock()
 				return
 			}
 			room, ok := rooms[receivedMsg.RoomID]
 			if !ok {
 				fmt.Println(ok, "roomnum error")
+				mu.Unlock()
 				return
 			}
-			fmt.Println(room.Players, len(room.Players))
-			if len(room.Players) == 1 {
-				if room.Players[0] != nil && clientID == room.Players[0].ID {
-					if receivedMsg.GameState.Player1X < 385 {
-						room.GameState.Player1X = receivedMsg.GameState.Player1X - 25
-					}
-					room.GameState.Player1Y = receivedMsg.GameState.Player1Y - 35
-					// fmt.Println(room.GameState.Player1Y)
-				}
-			} else if len(room.Players) == 2 {
-				if room.Players[0] != nil && clientID == room.Players[0].ID {
-					if receivedMsg.GameState.Player1X < 385 {
-						room.GameState.Player1X = receivedMsg.GameState.Player1X - 25
-					}
-					room.GameState.Player1Y = receivedMsg.GameState.Player1Y - 35
-					// fmt.Println(room.GameState.Player1Y)
-				}
-				if room.Players[1] != nil && clientID == room.Players[1].ID {
-					if receivedMsg.GameState.Player2X > 385 {
-						room.GameState.Player2X = receivedMsg.GameState.Player2X - 25
-					}
-					room.GameState.Player2Y = receivedMsg.GameState.Player2Y - 35
-					// fmt.Println(room.GameState.Player2Y)
-				}
-			} else {
-				continue
+			if room == nil {
+				mu.Unlock()
+				return
 			}
-			updateGameState(room)
+			mu.Unlock()
+			if room.Start {
+				mu.Lock()
+				fmt.Println(room.Players, len(room.Players))
+				if len(room.Players) == 1 {
+					if room.Players[0] != nil && clientID == room.Players[0].ID {
+						if receivedMsg.GameState.Player1X < 385 {
+							room.GameState.Player1X = receivedMsg.GameState.Player1X - 25
+						}
+						room.GameState.Player1Y = receivedMsg.GameState.Player1Y - 35
+						// fmt.Println(room.GameState.Player1Y)
+					}
+				} else if len(room.Players) == 2 {
+					if room.Players[0] != nil && clientID == room.Players[0].ID {
+						if receivedMsg.GameState.Player1X < 385 {
+							room.GameState.Player1X = receivedMsg.GameState.Player1X - 25
+						}
+						room.GameState.Player1Y = receivedMsg.GameState.Player1Y - 35
+						// fmt.Println(room.GameState.Player1Y)
+					}
+					if room.Players[1] != nil && clientID == room.Players[1].ID {
+						if receivedMsg.GameState.Player2X > 385 {
+							room.GameState.Player2X = receivedMsg.GameState.Player2X - 25
+						}
+						room.GameState.Player2Y = receivedMsg.GameState.Player2Y - 35
+						// fmt.Println(room.GameState.Player2Y)
+					}
+				}
+				mu.Unlock()
+				updateGameState(room)
+			}
 		} else if receivedMsg.Type == "audience" {
+			mu.Lock()
 			if receivedMsg.RoomID < 0 {
+				mu.Unlock()
 				return
 			}
 			room := rooms[receivedMsg.RoomID]
 			if room == nil {
 				message := `{"type":"error", "message": "ルームが存在しません"}`
 				conn.WriteMessage(messageType, []byte(message))
+				mu.Unlock()
 				return
 			}
 			audience := &models.Client{
@@ -399,6 +430,7 @@ func (c *UserController) HandleWebSocket(ctx *gin.Context) {
 				}
 			}
 			message := fmt.Sprintf(`{"type":"ready","message":"%s","RoomNum":"%d"}`, clientID, audience.RoomID)
+			mu.Unlock()
 			conn.WriteMessage(messageType, []byte(message))
 		} else {
 			fmt.Println("client error")
@@ -448,14 +480,21 @@ func BattleReady(roomnum int) {
 			Time:       60 * 120, //2min 120 * 60
 		},
 		Audience: make([]*models.Client, 0),
+		Start:    false,
 	}
 	rooms[roomnum] = newRoom
 }
 
-func Battle(clientID string) {
+func Battle(clientID string, clientID2 string) {
 	time.Sleep(5 * time.Second)
 	mu.Lock()
 	player, ok := clients[clientID]
+	if !ok {
+		fmt.Println("player is nil in Battle")
+		mu.Unlock()
+		return
+	}
+	player2, ok := clients[clientID2]
 	if !ok {
 		fmt.Println("player is nil in Battle")
 		mu.Unlock()
@@ -467,9 +506,15 @@ func Battle(clientID string) {
 		mu.Unlock()
 		return
 	}
+	conn2 := player2.Conn
+	if conn2 == nil {
+		fmt.Println("player.Conn is nil in Battle")
+		mu.Unlock()
+		return
+	}
 
 	roomnum := player.RoomID
-	fmt.Println(roomnum)
+	// fmt.Println(roomnum)
 	room, ok := rooms[roomnum]
 	if !ok {
 		fmt.Println(room, ok, "ルームが見つかりません")
@@ -478,11 +523,21 @@ func Battle(clientID string) {
 		mu.Unlock()
 		return
 	}
+	roomnum = player2.RoomID
+	// fmt.Println(roomnum)
+	room, ok = rooms[roomnum]
+	if !ok {
+		fmt.Println(room, ok, "ルームが見つかりません")
+		message := `{"type":"error", "message": "ルームが見つかりません"}`
+		conn.WriteMessage(websocket.TextMessage, []byte(message))
+		mu.Unlock()
+		return
+	}
 	mu.Unlock()
-	go gameLoop(room, conn)
+	go gameLoop(room)
 }
 
-func gameLoop(room *models.Room, conn *websocket.Conn) {
+func gameLoop(room *models.Room) {
 	if room == nil {
 		return
 	}
@@ -496,13 +551,18 @@ func gameLoop(room *models.Room, conn *websocket.Conn) {
 		mu.Unlock()
 		if room.GameState.Time <= 0 {
 			fmt.Println("ゲーム終了:", room.RoomID)
+			// for i := range room.Players {
+			// 	delete(clients, room.Players[i].ID)
+			// }
 			message := `{"type":"end", "message": "対戦終了"}`
-			conn.WriteMessage(websocket.TextMessage, []byte(message))
-			// return
-			rooms[room.RoomID] = nil
-			for i := range room.Players {
-				delete(clients, room.Players[i].ID)
+			room.Players[0].Conn.WriteMessage(websocket.TextMessage, []byte(message))
+			room.Players[1].Conn.WriteMessage(websocket.TextMessage, []byte(message))
+			if room.Audience != nil {
+				for i := range room.Audience {
+					room.Audience[i].Conn.WriteMessage(websocket.TextMessage, []byte(message))
+				}
 			}
+			rooms[room.RoomID] = nil
 			break
 		}
 		temporary(room)
@@ -524,7 +584,6 @@ func temporary(room *models.Room) {
 	// }
 	// パックの移動処理
 	mu.Lock()
-	defer mu.Unlock()
 	room.GameState.PuckX += room.GameState.PuckSpeedX
 	room.GameState.PuckY += room.GameState.PuckSpeedY
 
@@ -532,12 +591,11 @@ func temporary(room *models.Room) {
 	if room.GameState.PuckY <= 0 || room.GameState.PuckY >= 370 {
 		room.GameState.PuckSpeedY *= -1
 	}
-
+	mu.Unlock()
 }
 
 func updateGameState(room *models.Room) {
 	mu.Lock()
-	defer mu.Unlock()
 
 	// パックとパドルの反射処理
 	d := math.Sqrt((room.GameState.Player1X-room.GameState.PuckX)*(room.GameState.Player1X-room.GameState.PuckX) + (room.GameState.Player1Y-room.GameState.PuckY)*(room.GameState.Player1Y-room.GameState.PuckY))
@@ -584,6 +642,7 @@ func updateGameState(room *models.Room) {
 		room.GameState.PuckSpeedX = (rand.Float64()*3 + 2) * float64(rand.Intn(2)*2-1)
 		room.GameState.PuckSpeedY = (rand.Float64()*3 + 2) * float64(rand.Intn(2)*2-1)
 	}
+	mu.Unlock()
 }
 
 // クライアントにゲーム状態を送信
@@ -615,11 +674,10 @@ func broadcastGameState(room *models.Room) {
 
 func numControll() {
 	mu.Lock()
-	defer mu.Unlock()
 	usernum := len(clients)
 	// fmt.Println(clients)
-	message := fmt.Sprintf(`{"type":"usernum","usernum": %d}`, usernum)
 	for client := range clients {
+		message := fmt.Sprintf(`{"type":"usernum","usernum": %d}`, usernum)
 		err := clients[client].Conn.WriteMessage(websocket.TextMessage, []byte(message))
 		if err != nil {
 			fmt.Println("メッセージ送信エラー:", err)
@@ -639,5 +697,6 @@ func numControll() {
 			}
 		}
 	}
+	mu.Unlock()
 	// fmt.Println(userNum)
 }
